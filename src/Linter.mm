@@ -70,13 +70,15 @@ struct LinterSettings {        // == XmlParser::Settings
 };
 
 NppData nppData;
-FuncItem funcItem[3];
+FuncItem funcItem[5];   // Settings | Edit config | Lint Now | (sep) | About
 
 // Plugin state (mirrors the file-scope globals in linter.cpp).
 LinterSettings gSettings;
 std::vector<LinterError> gErrors;            // results of the last run
 std::map<intptr_t, std::string> gErrorText;  // caret position → message (== errorText)
 bool gReady = false;
+unsigned long long gLintGeneration = 0;      // ++ per runCheckNow; stale results are dropped
+bool gLinterWroteStatus = false;             // true while our text occupies the status-bar field
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scintilla / host helpers
@@ -213,10 +215,28 @@ void showTooltip() {
     }
 }
 
+// Persistent Linter status → the host status bar's plugin field
+// (NPPM_SETSTATUSBAR routes it to the dedicated middle segment). An empty string
+// clears it, but only if WE last wrote it, so we never wipe another plugin's
+// text. Per-position error messages stay in the call tip (showTooltip).
+//
+// NPPM_SETSTATUSBAR returns non-zero on hosts that implement the field and 0 on
+// older hosts (unhandled → no-op). For messages the user must not miss
+// (failures), fallbackTip=true surfaces them as a caret call tip when the host
+// has no status field, so behaviour never regresses on older builds.
+void setStatusBar(const std::string &message, bool fallbackTip = false) {
+    if (message.empty() && !gLinterWroteStatus) return;
+    intptr_t handled = app(NPPM_SETSTATUSBAR, STATUSBAR_DOC_TYPE, (intptr_t)message.c_str());
+    gLinterWroteStatus = !message.empty();
+    if (!handled && fallbackTip && !message.empty()) {
+        intptr_t position = sci(SCI_GETCURRENTPOS);
+        sci(SCI_CALLTIPSHOW, (uintptr_t)position, (intptr_t)message.c_str());
+    }
+}
+
 void showMessage(const std::string &message) {
     if (message.empty()) return;
-    intptr_t position = sci(SCI_GETCURRENTPOS);
-    sci(SCI_CALLTIPSHOW, (uintptr_t)position, (intptr_t)message.c_str());
+    setStatusBar(message, /*fallbackTip=*/true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -427,6 +447,7 @@ std::string runLinter(const std::string &command,
         }
 
         NSFileHandle *outHandle = stdoutPipe.fileHandleForReading;
+        NSFileHandle *errHandle = stderrPipe.fileHandleForReading;
         if (useStdin) {
             // Feed stdin on a background thread, then drain stdout, to avoid a
             // pipe-buffer deadlock (matches file.cpp's "close all the handles"
@@ -439,15 +460,47 @@ std::string runLinter(const std::string &command,
             });
         }
 
+        // Drain stderr concurrently: a linter that emits a lot of diagnostics to
+        // stderr would otherwise fill the pipe buffer, block, and never close its
+        // stdout — deadlocking the readDataToEndOfFile below.
+        __block NSData *errData = nil;
+        dispatch_semaphore_t errDone = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            @try { errData = [errHandle readDataToEndOfFile]; } @catch (...) {}
+            dispatch_semaphore_signal(errDone);
+        });
+
         NSData *outData = [outHandle readDataToEndOfFile];
         [task waitUntilExit];
+        dispatch_semaphore_wait(errDone, DISPATCH_TIME_FOREVER);
 
         if (tempFile) {
             [[NSFileManager defaultManager] removeItemAtPath:tempFile error:nil];
         }
 
-        if (!outData) return std::string();
-        return std::string((const char *)outData.bytes, outData.length);
+        int status = (int)task.terminationStatus;
+        std::string out = outData.length
+            ? std::string((const char *)outData.bytes, outData.length) : std::string();
+
+        // A linter that finds problems exits non-zero AND writes checkstyle XML to
+        // stdout — that is normal. Report a failure only when the command produced
+        // no output and exited non-zero (missing tool = 127, not executable = 126,
+        // or a crash). Surface the first line of stderr as the reason.
+        if (out.empty() && status != 0 && execFailure) {
+            std::string reason;
+            if (errData.length) {
+                reason.assign((const char *)errData.bytes, errData.length);
+                size_t nl = reason.find_first_of("\r\n");
+                if (nl != std::string::npos) reason.erase(nl);
+            }
+            std::string msg = "Linter: '" + command + "' ";
+            if (status == 127)      msg += "not found";
+            else if (status == 126) msg += "not executable";
+            else                    msg += "failed (exit " + std::to_string(status) + ")";
+            if (!reason.empty()) msg += ": " + reason;
+            *execFailure = msg;
+        }
+        return out;
     }
 }
 
@@ -489,6 +542,10 @@ bool collectCommands(std::vector<std::pair<std::string, bool>> &commands) {
 void runCheckNow() {
     if (!gReady) return;
 
+    // Mark this run; a slower in-flight run whose generation is stale by the time
+    // it finishes will not overwrite newer results/marks.
+    unsigned long long gen = ++gLintGeneration;
+
     std::vector<std::pair<std::string, bool>> commands;
     if (!collectCommands(commands)) {
         // No linter for this extension — make sure stale marks are gone.
@@ -496,6 +553,7 @@ void runCheckNow() {
             gErrors.clear();
             drawBoxes();
         }
+        setStatusBar("");   // release our status-bar field (if we held it)
         return;
     }
 
@@ -522,9 +580,17 @@ void runCheckNow() {
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (gen != gLintGeneration) return;   // superseded by a newer run
             gErrors = found;
             drawBoxes();
-            if (!failure.empty()) showMessage(failure);
+            if (!failure.empty()) {
+                setStatusBar(failure, /*fallbackTip=*/true);
+            } else {
+                size_t n = found.size();
+                setStatusBar(n ? ("Linter: " + std::to_string(n) +
+                                  (n == 1 ? " problem" : " problems"))
+                               : std::string());
+            }
         });
     });
 }
@@ -539,14 +605,14 @@ void scheduleCheck() {
     });
 }
 
-// initLinters() — load linter.xml, warn if empty/broken.
+// initLinters() — load linter.xml, surface only real parse failures.
 void initLinters() {
     std::string failure;
     gSettings = parseSettings(iniFilePath(), &failure);
+    // An empty / all-commented linter.xml is the normal unconfigured state, not
+    // an error — don't nag on every launch.
     if (!failure.empty()) {
         showMessage(failure);
-    } else if (gSettings.rules.empty()) {
-        showMessage("Linter: Empty linter.xml.");
     }
 }
 
@@ -845,8 +911,41 @@ static void cmdSettings() {
 static void cmdEditConfig() {
     @autoreleasepool {
         ensureDefaultConfig();
-        std::string path = iniFilePath();
+        // The host's NPPM_DOOPEN handler reads this pointer from a block it
+        // dispatches to the main queue — i.e. AFTER this function returns. A stack
+        // std::string's buffer would already be freed by then, so the host would
+        // open a dangling (nil) path and crash. Keep the path alive process-wide.
+        static std::string path;
+        path = iniFilePath();
         app(NPPM_DOOPEN, 0, (intptr_t)path.c_str());
+    }
+}
+
+// About — basic info + which linters to install.
+static void cmdAbout() {
+    @autoreleasepool {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = @"About Linter";
+        a.alertStyle  = NSAlertStyleInformational;
+        a.informativeText =
+            @"Linter v1.0.0 (macOS port)\n\n"
+             "Runs external command-line linters on the current document as you "
+             "type, parses their checkstyle XML output, and underlines the "
+             "problems. A summary shows in the status bar; hover a mark for its "
+             "message.\n\n"
+             "Linter drives tools you install yourself — install the ones you need "
+             "and make sure they are on your PATH:\n"
+             "•  JavaScript:  npm install -g eslint   →  eslint --format checkstyle\n"
+             "•  JavaScript:  npm install -g jshint   →  jshint --reporter=checkstyle\n"
+             "•  CSS:  npm install -g csslint   →  csslint --format=checkstyle-xml\n"
+             "•  PHP:  composer global require squizlabs/php_codesniffer   →  phpcs --report=checkstyle\n\n"
+             "Then map a file extension to a command in Plugins ▸ Linter ▸ "
+             "Settings… (or Edit config (XML)). The command must output "
+             "checkstyle-format XML.\n\n"
+             "Original Windows plugin by Vladimir Soshkin (MIT)\n"
+             "macOS port by Andrey Letov";
+        [a addButtonWithTitle:@"OK"];
+        [a runModal];
     }
 }
 
@@ -872,6 +971,14 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
     strncpy(funcItem[2]._itemName, "Lint Now", NPP_MENU_ITEM_SIZE - 1);
     funcItem[2]._pFunc = cmdRecheck;
     funcItem[2]._pShKey = nullptr;
+
+    strncpy(funcItem[3]._itemName, "---", NPP_MENU_ITEM_SIZE - 1);   // separator
+    funcItem[3]._pFunc = nullptr;
+    funcItem[3]._pShKey = nullptr;
+
+    strncpy(funcItem[4]._itemName, "About…", NPP_MENU_ITEM_SIZE - 1);
+    funcItem[4]._pFunc = cmdAbout;
+    funcItem[4]._pShKey = nullptr;
 
     ensureDefaultConfig();
 }
@@ -905,7 +1012,10 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *notifyCode) {
 
     switch (notifyCode->nmhdr.code) {
         case NPPN_BUFFERACTIVATED:
-            // New buffer became active → re-lint (== isBufferChanged path).
+            // New buffer became active → re-lint. Bump the generation so an
+            // in-flight lint from the previous buffer can't draw its markers on
+            // this one (== isBufferChanged path).
+            ++gLintGeneration;
             initErrors();
             scheduleCheck();
             break;
